@@ -450,7 +450,7 @@ if "active_session_id" not in st.session_state or st.session_state.get("active_c
         # Seed patient opener
         db.add(Message(session_id=sid, role="patient", content=active_case["prompt"]))
         db.commit()
-    st.experimental_rerun()
+    st.rerun()
 
 st.info(f"Case: **{active_case['title']}**  •  Session: `{st.session_state.active_session_id[:8]}`")
 

@@ -1,7 +1,8 @@
 openai
 streamlit
-streamlit>=1.33.0
-sqlalchemy>=2.0.25
-psycopg2-binary>=2.9.9   # Postgres driver (safe to leave even if using SQLite)
-openai>=1.12.0           # for LLM engine (only used if API key is provided)
-pandas>=2.2.0            # optional: for analysis / future dashboards
+streamlit>=1.33.0       # web app UI
+sqlalchemy>=2.0.25      # ORM for SQLite/Postgres
+psycopg2-binary>=2.9.9  # Postgres driver (safe to leave, ignored if using SQLite)
+openai>=1.12.0          # OpenAI API client
+pandas>=2.2.0           # optional but useful for analysis / reporting
+

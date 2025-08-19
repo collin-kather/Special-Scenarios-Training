@@ -1,43 +1,35 @@
-# app.py
-# ================================
-# Provider–Patient Comm Simulator
-# ================================
-# - Streamlit chat UI
-# - Five special scenarios (bad news, noncompliance, sensitive topics, cultural barriers, time-pressured)
-# - Two engines: Rule-based (offline) OR OpenAI (conversational)
-# - SQL-backed: users, sessions, messages, scores
-#
-# Quick start:
-#   pip install streamlit sqlalchemy psycopg2-binary openai
-#   streamlit run app.py
-#
-# Secrets (optional):
-#   DB_URL = "postgresql+psycopg2://USER:PASSWORD@HOST:5432/DBNAME"
-#   OPENAI_API_KEY = "sk-..."
-#
+# app.py — LLM-only Provider–Patient Communication Simulator
+# -----------------------------------------------------------
+# pip install: streamlit sqlalchemy psycopg2-binary openai pandas
+# Run: streamlit run app.py
 import os
 import uuid
 import datetime as dt
 from typing import Dict, Any, List
 
 import streamlit as st
-from sqlalchemy import (
-    create_engine, Column, Integer, String, DateTime, ForeignKey, Text, JSON
-)
+from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey, Text, JSON
 from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 
-# --- Optional OpenAI (used if key provided) ---
-OPENAI_DEFAULT_MODEL = "gpt-4o-mini"  # you can change in UI
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except Exception:
-    OPENAI_AVAILABLE = False
+from openai import OpenAI
 
 # -------------------------------
-# DB Setup
+# Config & Secrets
 # -------------------------------
+st.set_page_config(page_title="Healthcare Comm Simulator (LLM-only)", page_icon="🩺", layout="centered")
+
+OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
+MODEL_DEFAULT = "gpt-4o-mini"   # change if you like
 DB_URL = st.secrets.get("DB_URL", os.getenv("DB_URL", "sqlite:///comm_sim.db"))
+
+if not OPENAI_API_KEY:
+    st.warning("Add OPENAI_API_KEY to `.streamlit/secrets.toml` (or environment) to use this app.", icon="🗝️")
+
+client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+
+# -------------------------------
+# Database setup (SQLite by default; Postgres via DB_URL)
+# -------------------------------
 engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
@@ -80,7 +72,7 @@ class Score(Base):
 Base.metadata.create_all(bind=engine)
 
 # -------------------------------
-# Scenarios (5 Special Scenarios)
+# Scenarios (5 special cases)
 # -------------------------------
 CASES: Dict[str, Dict[str, Any]] = {
     "bad_news_spikes": {
@@ -158,7 +150,7 @@ CASES: Dict[str, Dict[str, Any]] = {
 }
 
 # -------------------------------
-# Lightweight Detectors (rules)
+# Simple detectors to drive scoring
 # -------------------------------
 def contains_any(text: str, needles: List[str]) -> bool:
     t = text.lower()
@@ -242,99 +234,45 @@ def reveal_keys_for_case(case_id: str, clinician_text: str) -> List[str]:
     return reveals
 
 # -------------------------------
-# Engine A: Rule-based patient (offline)
+# LLM Patient reply
 # -------------------------------
-def rule_based_patient_reply(case_id: str, clinician_text: str, revealed: set) -> str:
+def llm_patient_reply(case_id: str, transcript: List[Dict[str, str]], revealed: set, model: str) -> str:
     case = CASES[case_id]
-    for k in reveal_keys_for_case(case_id, clinician_text):
-        revealed.add(k)
-
-    if case_id == "bad_news_spikes":
-        if detect_warn_shot(clinician_text) and detect_empathy(clinician_text):
-            return "(Patient) …Okay. Please tell me plainly."
-        if "support_person" in revealed:
-            return case["info"]["support_person"]
-        if "prior_suspicion" in revealed:
-            return case["info"]["prior_suspicion"]
-        return "(Patient) I’m scared. Just… say it clearly, please."
-
-    if case_id == "noncompliance_mi":
-        if detect_reflective_listening(clinician_text) or detect_affirmation(clinician_text):
-            if "side_effects" in revealed:
-                return case["info"]["side_effects"]
-            if "cost_barrier" in revealed:
-                return case["info"]["cost_barrier"]
-            return "(Patient) I just don’t see the point."
-        return "(Patient) I said I’m not taking it."
-
-    if case_id == "sensitive_topics":
-        if detect_normalize(clinician_text) and detect_confidentiality(clinician_text):
-            for key in ["sexual_health", "mental_health", "substance_use"]:
-                if key in revealed:
-                    return case["info"][key]
-            return "(Patient) Thank you… where do I even start?"
-        return "(Patient) I don’t want to be judged."
-
-    if case_id == "cultural_barriers":
-        if detect_interpreter_offer(clinician_text):
-            revealed.add("interpreter_need")
-            return case["info"]["interpreter_need"]
-        if "beliefs" in revealed:
-            return case["info"]["beliefs"]
-        if detect_ask_preferences(clinician_text):
-            return "(Patient) I like simple words and examples."
-        return "(Patient) I understand some, not everything."
-
-    if case_id == "time_pressured":
-        if detect_set_expectations(clinician_text) and detect_prioritize(clinician_text):
-            for key in ["fear_needles", "cost"]:
-                if key in revealed:
-                    return case["info"][key]
-            return "(Patient) Just tell me what we can do right now."
-        return "(Patient) I’m in a rush and in pain."
-
-    return "(Patient) Could you explain differently?"
-
-# -------------------------------
-# Engine B: OpenAI LLM patient (if key provided)
-# -------------------------------
-def openai_patient_reply(client, model: str, case_id: str, transcript: List[Dict[str, str]], revealed: set) -> str:
-    case = CASES[case_id]
-    # Update reveals from latest clinician turn
+    # Update reveals from latest clinician turn (transcript uses roles: user=clinician, assistant=patient)
     last_user = transcript[-1]["content"] if transcript and transcript[-1]["role"] == "user" else ""
     for k in reveal_keys_for_case(case_id, last_user):
         revealed.add(k)
 
+    hidden_dump = {k: case["info"][k] for k in case["reveals"].keys()}
+
     system_instructions = f"""
-You are role-playing as a realistic PATIENT for a training simulator. Stay in character. 
-CASE: {case['title']} | Patient opener already provided.
-RULES:
-- Never reveal hidden facts unless the clinician prompts in the right area.
-- Keep replies concise (1–3 sentences).
-- Emotional tone should reflect the situation.
-- If clinician uses jargon, ask for a simpler explanation.
-- Encourage shared decision-making and teach-back when appropriate.
+You are role-playing as a realistic PATIENT for a clinician communication training simulator. Stay in character.
+CASE: {case['title']} | The patient opener has already been given.
 
-HIDDEN FACTS AVAILABLE TO REVEAL ONLY IF ELICITED:
-{ {k: case["info"][k] for k in case["reveals"].keys()} }
+Rules:
+- Keep replies concise (1–3 sentences), emotionally congruent, and realistic.
+- Do NOT reveal hidden facts unless the clinician probes that area.
+- If the clinician uses jargon, ask for simpler words.
+- Encourage shared decision-making and accept teach-back prompts when offered.
 
-CURRENTLY ELIGIBLE TO REVEAL (because clinician probed): {list(revealed)}
-MUST-HAVES the clinician should ideally cover: {case['must_include']}
-"""
-    # Build a minimal conversation: system + compact last few turns
-    # Convert our transcript to OpenAI roles: user=clinician, assistant=patient
+Hidden facts (only reveal if elicited): {hidden_dump}
+Currently eligible to reveal based on clinician probing: {list(revealed)}
+Must-have clinician communication targets for this case: {case['must_include']}
+Respond ONLY as the patient.
+""".strip()
+
     messages = [{"role": "system", "content": system_instructions}]
-    for m in transcript[-10:]:  # last 10 turns for brevity
-        if m["role"] == "user":
-            messages.append({"role": "user", "content": m["content"]})
-        else:
-            messages.append({"role": "assistant", "content": m["content"]})
+    messages.extend(transcript[-12:])  # last few turns for context
 
-    resp = client.chat.completions.create(model=model, messages=messages, temperature=0.7)
+    resp = client.chat.completions.create(
+        model=model,
+        messages=messages,
+        temperature=0.7,
+    )
     return resp.choices[0].message.content.strip()
 
 # -------------------------------
-# Scoring Engine
+# Scoring
 # -------------------------------
 def score_session(db, session_id: str, case_id: str) -> Dict[str, Any]:
     msgs: List[Message] = (
@@ -409,11 +347,10 @@ def score_session(db, session_id: str, case_id: str) -> Dict[str, Any]:
     return {"overall": overall, "subscores": subs, "feedback": "\n".join(fb_lines)}
 
 # -------------------------------
-# UI
+# UI & Conversation Loop
 # -------------------------------
-st.set_page_config(page_title="Healthcare Comm Simulator", page_icon="🩺", layout="centered")
-st.title("🩺 Provider–Patient Communication Simulator")
-st.caption("Text-based • LLM-optional • SQL-backed transcripts & scores")
+st.title("🩺 Provider–Patient Communication Simulator (LLM)")
+st.caption("Text-based • OpenAI patient • SQL-backed transcripts & scores")
 
 # Bootstrap anon user
 if "user_id" not in st.session_state:
@@ -423,7 +360,7 @@ if "user_id" not in st.session_state:
             db.add(User(id=st.session_state.user_id, email=None))
             db.commit()
 
-# Engine selection + OpenAI key
+# Scenario picker + model picker
 left, right = st.columns([2, 1])
 with left:
     case_ids = list(CASES.keys())
@@ -433,13 +370,12 @@ with left:
     active_case_id = case_ids[sel_idx]
     active_case = CASES[active_case_id]
 with right:
-    engine_choice = st.radio("Engine", ["Rule-based (offline)", "OpenAI (LLM)"], index=0)
-
-openai_api_key = st.text_input("OpenAI API Key (only if using LLM)", type="password",
-                               value=st.secrets.get("OPENAI_API_KEY", ""))
+    model_name = st.selectbox("OpenAI model", [MODEL_DEFAULT, "gpt-4o"], index=0)
 
 # Start/reset session per case switch
 if "active_session_id" not in st.session_state or st.session_state.get("active_case_id") != active_case_id:
+    if not client:
+        st.stop()
     with SessionLocal() as db:
         sid = str(uuid.uuid4())
         db.add(CaseSession(id=sid, user_id=st.session_state.user_id, case_id=active_case_id))
@@ -466,7 +402,6 @@ for m in existing:
     with st.chat_message("assistant" if m.role == "patient" else "user"):
         st.markdown(m.content)
 
-# Build a compact transcript for LLM when needed
 def current_transcript_for_llm(db) -> List[Dict[str, str]]:
     msgs = (
         db.query(Message)
@@ -475,6 +410,7 @@ def current_transcript_for_llm(db) -> List[Dict[str, str]]:
         .all()
     )
     conv = []
+    # Convert to OpenAI roles: user=clinician, assistant=patient
     for m in msgs:
         conv.append({"role": "assistant" if m.role == "patient" else "user", "content": m.content})
     return conv
@@ -482,24 +418,20 @@ def current_transcript_for_llm(db) -> List[Dict[str, str]]:
 # Chat input
 prompt = st.chat_input("Type your response to the patient…")
 if prompt:
+    if not client:
+        st.error("OpenAI client not initialized. Add OPENAI_API_KEY to secrets.", icon="🚫")
+        st.stop()
+
     # Store clinician message
     with SessionLocal() as db:
         db.add(Message(session_id=st.session_state.active_session_id, role="clinician", content=prompt))
         db.commit()
     with st.chat_message("user"): st.markdown(prompt)
 
-    # Decide engine
-    if engine_choice == "OpenAI (LLM)" and OPENAI_AVAILABLE and (openai_api_key or st.secrets.get("OPENAI_API_KEY")):
-        try:
-            client = OpenAI(api_key=openai_api_key or st.secrets.get("OPENAI_API_KEY"))
-            transcript = current_transcript_for_llm(SessionLocal())
-            model = st.selectbox("LLM model", [OPENAI_DEFAULT_MODEL, "gpt-4o", "gpt-4o-mini-tts"], index=0, key="model_box")
-            reply = openai_patient_reply(client, model, st.session_state.active_case_id, transcript, st.session_state.revealed)
-        except Exception as e:
-            st.warning(f"LLM error; falling back to rule-based. ({e})")
-            reply = rule_based_patient_reply(st.session_state.active_case_id, prompt, st.session_state.revealed)
-    else:
-        reply = rule_based_patient_reply(st.session_state.active_case_id, prompt, st.session_state.revealed)
+    # Build transcript and get LLM patient reply
+    with SessionLocal() as db:
+        transcript = current_transcript_for_llm(db)
+    reply = llm_patient_reply(st.session_state.active_case_id, transcript, st.session_state.revealed, model=model_name)
 
     # Store patient reply
     with SessionLocal() as db:
@@ -510,7 +442,7 @@ if prompt:
 # Controls
 c1, c2, c3 = st.columns(3)
 with c1:
-    if st.button("End Session & Debrief", type="primary"):
+    if st.button("End Session & Debrief", type="primary", use_container_width=True):
         with SessionLocal() as db:
             s = db.query(CaseSession).get(st.session_state.active_session_id)
             s.ended_at = dt.datetime.utcnow()
@@ -526,7 +458,7 @@ with c1:
         st.success("Session saved & scored.")
 
 with c2:
-    if st.button("Start Fresh (same case)"):
+    if st.button("Start Fresh (same case)", use_container_width=True):
         with SessionLocal() as db:
             sid = str(uuid.uuid4())
             db.add(CaseSession(id=sid, user_id=st.session_state.user_id, case_id=st.session_state.active_case_id))
@@ -538,11 +470,11 @@ with c2:
         st.rerun()
 
 with c3:
-    if st.button("Switch Case (reset)"):
+    if st.button("Switch Case (reset)", use_container_width=True):
         st.session_state.pop("active_session_id", None)
         st.rerun()
 
-# Debrief panel (if exists)
+# Debrief (if exists)
 with SessionLocal() as db:
     sc = db.query(Score).filter(Score.session_id == st.session_state.active_session_id).first()
     if sc:
@@ -556,4 +488,4 @@ with SessionLocal() as db:
             st.write("**Feedback**")
             st.text(sc.feedback)
 
-st.caption("Tip: Use SQLite for dev; set DB_URL for Postgres. Provide an OpenAI key to enable the LLM patient.")
+st.caption("SQLite by default. Set DB_URL for Postgres. Add OPENAI_API_KEY in secrets to enable the LLM.")

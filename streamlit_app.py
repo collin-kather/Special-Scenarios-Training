@@ -1,7 +1,8 @@
-# app.py — LLM-only Provider–Patient Communication Simulator
-# -----------------------------------------------------------
+# app.py — LLM-only Provider–Patient Communication Simulator (Option A key entry)
+# ------------------------------------------------------------------------------
 # pip install: streamlit sqlalchemy psycopg2-binary openai pandas
 # Run: streamlit run app.py
+
 import os
 import uuid
 import datetime as dt
@@ -14,22 +15,28 @@ from sqlalchemy.orm import declarative_base, sessionmaker, relationship
 from openai import OpenAI
 
 # -------------------------------
-# Config & Secrets
+# Page config
 # -------------------------------
 st.set_page_config(page_title="Healthcare Comm Simulator (LLM-only)", page_icon="🩺", layout="centered")
 
-OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-MODEL_DEFAULT = "gpt-4o-mini"   # change if you like
-DB_URL = st.secrets.get("DB_URL", os.getenv("DB_URL", "sqlite:///comm_sim.db"))
-
+# -------------------------------
+# Option A: Prompt for API key at runtime (no files, no Git)
+# -------------------------------
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
-    st.warning("Add OPENAI_API_KEY to `.streamlit/secrets.toml` (or environment) to use this app.", icon="🗝️")
+    OPENAI_API_KEY = st.text_input("Enter your OpenAI API key", type="password", help="Your key is not saved to disk.")
+    if not OPENAI_API_KEY:
+        st.info("Add your OpenAI API key above to continue.", icon="🗝️")
+        st.stop()
 
-client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+# Create OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
+MODEL_DEFAULT = "gpt-4o-mini"  # change if you like
 
 # -------------------------------
-# Database setup (SQLite by default; Postgres via DB_URL)
+# Database setup (SQLite by default; Postgres via DB_URL env if you want)
 # -------------------------------
+DB_URL = os.getenv("DB_URL", "sqlite:///comm_sim.db")
 engine = create_engine(DB_URL, pool_pre_ping=True, future=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 Base = declarative_base()
@@ -150,7 +157,7 @@ CASES: Dict[str, Dict[str, Any]] = {
 }
 
 # -------------------------------
-# Simple detectors to drive scoring
+# Detectors for scoring
 # -------------------------------
 def contains_any(text: str, needles: List[str]) -> bool:
     t = text.lower()
@@ -234,35 +241,33 @@ def reveal_keys_for_case(case_id: str, clinician_text: str) -> List[str]:
     return reveals
 
 # -------------------------------
-# LLM Patient reply
+# LLM patient reply
 # -------------------------------
 def llm_patient_reply(case_id: str, transcript: List[Dict[str, str]], revealed: set, model: str) -> str:
     case = CASES[case_id]
-    # Update reveals from latest clinician turn (transcript uses roles: user=clinician, assistant=patient)
     last_user = transcript[-1]["content"] if transcript and transcript[-1]["role"] == "user" else ""
     for k in reveal_keys_for_case(case_id, last_user):
         revealed.add(k)
 
     hidden_dump = {k: case["info"][k] for k in case["reveals"].keys()}
-
     system_instructions = f"""
-You are role-playing as a realistic PATIENT for a clinician communication training simulator. Stay in character.
-CASE: {case['title']} | The patient opener has already been given.
+You are a realistic PATIENT in a clinician communication training simulator. Stay in character.
+CASE: {case['title']}.
 
 Rules:
-- Keep replies concise (1–3 sentences), emotionally congruent, and realistic.
+- Reply in 1–3 sentences; keep tone emotionally congruent.
 - Do NOT reveal hidden facts unless the clinician probes that area.
-- If the clinician uses jargon, ask for simpler words.
-- Encourage shared decision-making and accept teach-back prompts when offered.
+- If clinician uses jargon, ask for simpler words.
+- Accept teach-back prompts; engage in shared decision-making.
 
-Hidden facts (only reveal if elicited): {hidden_dump}
-Currently eligible to reveal based on clinician probing: {list(revealed)}
-Must-have clinician communication targets for this case: {case['must_include']}
+Hidden facts (reveal only if elicited): {hidden_dump}
+Currently eligible to reveal: {list(revealed)}
+Must-have clinician communication targets: {case['must_include']}
 Respond ONLY as the patient.
 """.strip()
 
     messages = [{"role": "system", "content": system_instructions}]
-    messages.extend(transcript[-12:])  # last few turns for context
+    messages.extend(transcript[-12:])  # compact context
 
     resp = client.chat.completions.create(
         model=model,
@@ -374,8 +379,6 @@ with right:
 
 # Start/reset session per case switch
 if "active_session_id" not in st.session_state or st.session_state.get("active_case_id") != active_case_id:
-    if not client:
-        st.stop()
     with SessionLocal() as db:
         sid = str(uuid.uuid4())
         db.add(CaseSession(id=sid, user_id=st.session_state.user_id, case_id=active_case_id))
@@ -418,10 +421,6 @@ def current_transcript_for_llm(db) -> List[Dict[str, str]]:
 # Chat input
 prompt = st.chat_input("Type your response to the patient…")
 if prompt:
-    if not client:
-        st.error("OpenAI client not initialized. Add OPENAI_API_KEY to secrets.", icon="🚫")
-        st.stop()
-
     # Store clinician message
     with SessionLocal() as db:
         db.add(Message(session_id=st.session_state.active_session_id, role="clinician", content=prompt))
@@ -488,4 +487,5 @@ with SessionLocal() as db:
             st.write("**Feedback**")
             st.text(sc.feedback)
 
-st.caption("SQLite by default. Set DB_URL for Postgres. Add OPENAI_API_KEY in secrets to enable the LLM.")
+st.caption("Enter your API key above each run. SQLite by default. Set DB_URL env for Postgres if needed.")
+

@@ -535,12 +535,12 @@ with c2:
             st.session_state.revealed = set()
             db.add(Message(session_id=sid, role="patient", content=active_case["prompt"]))
             db.commit()
-        st.experimental_rerun()
+        st.rerun()
 
 with c3:
     if st.button("Switch Case (reset)"):
         st.session_state.pop("active_session_id", None)
-        st.experimental_rerun()
+        st.rerun()
 
 # Debrief panel (if exists)
 with SessionLocal() as db:
